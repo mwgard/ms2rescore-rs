@@ -60,10 +60,10 @@ pub fn parse_precursor_info(
 
 /// Read MS2 spectra from spectrum files with mzdata
 pub fn read_ms2_spectra(spectrum_path: &str) -> Result<Vec<MS2Spectrum>, std::io::Error> {
-    let mut reader = MZReader::open_path(spectrum_path)?;
-    if let MZReader::ThermoRaw(inner) = &mut reader {
-        inner.set_centroiding(true);
-    }
+    let reader = MZReader::open_path(spectrum_path)?;
+    // if let MZReader::ThermoRaw(inner) = &mut reader {
+    //     inner.set_centroiding(true);
+    // }
 
     Ok(reader
         .filter(|spectrum| spectrum.description.ms_level == 2)
