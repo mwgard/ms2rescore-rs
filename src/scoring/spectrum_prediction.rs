@@ -16,6 +16,10 @@ use pyo3::types::{PyAny, PyModule};
 use rayon::prelude::*;
 
 const CLIP_LOG2_MIN: f64 = crate::utils::LOG2_FLOOR_F64; // (0.001_f64).log2()
+const SPECTRA_ANGLE_EPS: f64 = 1e-7;
+/// Intensities at or below this value count as absent peaks in the NIST ratio of peak pairs.
+/// Unlogged floor values (2^log2(0.001) - 0.001) are ~0 up to floating point noise.
+const NIST_NOISE_THRESHOLD: f64 = 1e-9;
 
 #[inline]
 fn clip_min_f32(x: f32) -> f64 {
@@ -59,6 +63,28 @@ fn any_to_vec_f32<'py>(
     } else {
         Ok(ro.as_array().iter().copied().collect())
     }
+}
+
+#[inline]
+fn any_to_vec_f64<'py>(
+    np: &'py Bound<'py, PyModule>,
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<Vec<f64>> {
+    let arr_any = np.getattr("ascontiguousarray")?.call1((obj, "float64"))?;
+    let arr = arr_any.cast::<PyArray1<f64>>()?;
+    let ro = arr.readonly();
+    if let Ok(slice) = ro.as_slice() {
+        Ok(slice.to_vec())
+    } else {
+        Ok(ro.as_array().iter().copied().collect())
+    }
+}
+
+/// Positive log-like transform used for the m/z-weighted log-space features, so that
+/// fractional exponents are defined: ln(unlogged + 1.001).
+#[inline]
+fn positive_log(x: f64) -> f64 {
+    (x + 1.001).ln()
 }
 
 fn pearson(x: &[f64], y: &[f64]) -> f64 {
@@ -245,6 +271,99 @@ fn cosine2(a1: &[f64], a2: &[f64], b1: &[f64], b2: &[f64]) -> f64 {
     d / (nx * ny)
 }
 
+/// Spectral angle similarity (Toprak et al., 2014): 1 - 2 * arccos(cos) / pi.
+fn spectral_angle(x: &[f64], y: &[f64]) -> f64 {
+    if x.len() != y.len() || x.is_empty() {
+        return f64::NAN;
+    }
+    let d = dot(x, y);
+    if !d.is_finite() {
+        return f64::NAN;
+    }
+    // epsilon safeguard on the squared norms, as in the reference implementation
+    let nx = x.iter().map(|v| v * v).sum::<f64>().max(SPECTRA_ANGLE_EPS).sqrt();
+    let ny = y.iter().map(|v| v * v).sum::<f64>().max(SPECTRA_ANGLE_EPS).sqrt();
+    let c = (d / (nx * ny)).clamp(-1.0, 1.0);
+    1.0 - 2.0 * c.acos() / std::f64::consts::PI
+}
+
+/// SpectraST dot product (Lam et al., 2007): squared cosine of the unit-normalized spectra.
+fn spectrast(x: &[f64], y: &[f64]) -> f64 {
+    let c = cosine_similarity(x, y);
+    if !c.is_finite() {
+        return f64::NAN;
+    }
+    c * c
+}
+
+#[inline]
+fn weight_peaks(mz: &[f64], intensity: &[f64], mz_weight: f64, intensity_weight: f64) -> Vec<f64> {
+    mz.iter()
+        .zip(intensity.iter())
+        .map(|(m, i)| i.powf(intensity_weight) * m.powf(mz_weight))
+        .collect()
+}
+
+/// Weighted (Sokolow: m/z^1, intensity^0.5) normalized dot product.
+fn weighted_dotprod(mz: &[f64], x: &[f64], y: &[f64]) -> f64 {
+    if mz.len() != x.len() || x.len() != y.len() || x.is_empty() {
+        return f64::NAN;
+    }
+    let a = weight_peaks(mz, x, 1.0, 0.5);
+    let b = weight_peaks(mz, y, 1.0, 0.5);
+    cosine_similarity(&a, &b)
+}
+
+/// NIST MS/MS match factor (Stein & Scott, 1994): weighted dot product cosine (DPC; m/z^1,
+/// intensity^0.5) combined with the ratio of peak pairs (RPP; intensity^1) of consecutive
+/// peaks present in both spectra (intensity > `NIST_NOISE_THRESHOLD`).
+///
+/// `x` plays the role of the "unknown" spectrum: the number of its peaks weights the DPC.
+fn nist_match_factor(mz: &[f64], x: &[f64], y: &[f64]) -> f64 {
+    let n = mz.len();
+    if n != x.len() || n != y.len() || n == 0 {
+        return f64::NAN;
+    }
+    if mz.iter().chain(x.iter()).chain(y.iter()).any(|v| !v.is_finite()) {
+        return f64::NAN;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&i, &j| mz[i].total_cmp(&mz[j]));
+    let mz_s: Vec<f64> = order.iter().map(|&i| mz[i]).collect();
+    let x_s: Vec<f64> = order.iter().map(|&i| x[i]).collect();
+    let y_s: Vec<f64> = order.iter().map(|&i| y[i]).collect();
+
+    // DPC
+    let a = weight_peaks(&mz_s, &x_s, 1.0, 0.5);
+    let b = weight_peaks(&mz_s, &y_s, 1.0, 0.5);
+    let num = dot(&a, &b).powi(2);
+    let den = a.iter().map(|v| v * v).sum::<f64>() * b.iter().map(|v| v * v).sum::<f64>();
+    let dpc = if den > 0.0 && num.is_finite() { num / den } else { 0.0 };
+
+    // RPP over consecutive peaks common to both spectra
+    let common: Vec<usize> = (0..n)
+        .filter(|&i| x_s[i] > NIST_NOISE_THRESHOLD && y_s[i] > NIST_NOISE_THRESHOLD)
+        .collect();
+    let n_common = common.len();
+    if n_common < 2 {
+        return 0.0;
+    }
+    let n_x = x_s.iter().filter(|&&v| v > NIST_NOISE_THRESHOLD).count();
+    let rpp_sum: f64 = common
+        .windows(2)
+        .map(|w| {
+            let r = (y_s[w[1]] / y_s[w[0]]) * (x_s[w[0]] / x_s[w[1]]);
+            if r < 1.0 {
+                r
+            } else {
+                1.0 / r
+            }
+        })
+        .sum();
+    let rpp = rpp_sum / n_x as f64;
+    (n_x as f64 * dpc + n_common as f64 * rpp) / (n_x + n_common) as f64
+}
+
 fn mean_std(x: &[f64]) -> (f64, f64) {
     let n = x.len();
     if n == 0 {
@@ -321,7 +440,78 @@ fn spearman(x: &[f64], y: &[f64]) -> f64 {
     pearson(&rx, &ry)
 }
 
+/// Compute MS²PIP spectrum comparison features from predicted and observed b/y intensities
+/// (log2(TIC-normalized + 0.001), as returned by MS²PIP).
+///
+/// If ``theoretical_mz_b`` and ``theoretical_mz_y`` are given, the m/z-weighted features
+/// (``weighted_dotprod*`` and ``nist_match_factor*``) are added as well.
+/// Spectral angle, SpectraST, weighted dot product, and NIST match factor features in log
+/// (``*_norm``) and unlogged space. The m/z-weighted features are only added if the
+/// concatenated (b then y) theoretical m/z values are given.
+#[allow(clippy::too_many_arguments)]
+fn add_similarity_features(
+    feats: &mut HashMap<String, f64>,
+    tb: &[f64],
+    ty: &[f64],
+    pb: &[f64],
+    pyv: &[f64],
+    tb_u: &[f64],
+    ty_u: &[f64],
+    pb_u: &[f64],
+    py_u: &[f64],
+    t_all_u: &[f64],
+    p_all_u: &[f64],
+    mz_all: Option<&[f64]>,
+) {
+    let t_all: Vec<f64> = tb.iter().chain(ty.iter()).copied().collect();
+    let p_all: Vec<f64> = pb.iter().chain(pyv.iter()).copied().collect();
+    let mut put = |name: &str, value: f64| {
+        feats.insert(name.into(), finite_or_zero(value));
+    };
+
+    // log space
+    put("spectrast_norm", spectrast(&t_all, &p_all));
+    put("spectrast_ionb_norm", spectrast(tb, pb));
+    put("spectrast_iony_norm", spectrast(ty, pyv));
+    put("spectral_angle_norm", spectral_angle(&t_all, &p_all));
+    put("spectral_angle_ionb_norm", spectral_angle(tb, pb));
+    put("spectral_angle_iony_norm", spectral_angle(ty, pyv));
+    // normal space
+    put("spectrast", spectrast(t_all_u, p_all_u));
+    put("spectrast_ionb", spectrast(tb_u, pb_u));
+    put("spectrast_iony", spectrast(ty_u, py_u));
+    put("spectral_angle", spectral_angle(t_all_u, p_all_u));
+    put("spectral_angle_ionb", spectral_angle(tb_u, pb_u));
+    put("spectral_angle_iony", spectral_angle(ty_u, py_u));
+
+    let Some(mz_all) = mz_all else {
+        return;
+    };
+    if mz_all.len() != t_all.len() {
+        return;
+    }
+    let (mz_b, mz_y) = mz_all.split_at(tb.len());
+    // positive log-like values for fractional exponents in log space
+    let pos = |v: &[f64]| -> Vec<f64> { v.iter().copied().map(positive_log).collect() };
+    let (tb_p, ty_p, pb_p, py_p) = (pos(tb_u), pos(ty_u), pos(pb_u), pos(py_u));
+    let (t_all_p, p_all_p) = (pos(t_all_u), pos(p_all_u));
+
+    put("weighted_dotprod_norm", weighted_dotprod(mz_all, &t_all_p, &p_all_p));
+    put("weighted_dotprod_ionb_norm", weighted_dotprod(mz_b, &tb_p, &pb_p));
+    put("weighted_dotprod_iony_norm", weighted_dotprod(mz_y, &ty_p, &py_p));
+    put("nist_match_factor_norm", nist_match_factor(mz_all, &t_all_p, &p_all_p));
+    put("weighted_dotprod", weighted_dotprod(mz_all, t_all_u, p_all_u));
+    put("weighted_dotprod_ionb", weighted_dotprod(mz_b, tb_u, pb_u));
+    put("weighted_dotprod_iony", weighted_dotprod(mz_y, ty_u, py_u));
+    put("nist_match_factor", nist_match_factor(mz_all, t_all_u, p_all_u));
+}
+
 #[pyfunction]
+#[pyo3(signature = (
+    psm_indices, predicted_b, predicted_y, observed_b, observed_y,
+    theoretical_mz_b=None, theoretical_mz_y=None
+))]
+#[allow(clippy::too_many_arguments)]
 pub fn ms2pip_features_from_prediction_peak_arrays(
     py: Python<'_>,
     psm_indices: Vec<usize>,
@@ -329,6 +519,8 @@ pub fn ms2pip_features_from_prediction_peak_arrays(
     predicted_y: Vec<Py<PyAny>>,
     observed_b: Vec<Py<PyAny>>,
     observed_y: Vec<Py<PyAny>>,
+    theoretical_mz_b: Option<Vec<Py<PyAny>>>,
+    theoretical_mz_y: Option<Vec<Py<PyAny>>>,
 ) -> PyResult<Vec<(usize, HashMap<String, f64>)>> {
     let n = psm_indices.len();
     if predicted_b.len() != n
@@ -340,6 +532,22 @@ pub fn ms2pip_features_from_prediction_peak_arrays(
             "All inputs must have identical length: psm_indices, predicted_b, predicted_y, observed_b, observed_y",
         ));
     }
+    let theoretical_mz = match (theoretical_mz_b, theoretical_mz_y) {
+        (Some(mb), Some(my)) => {
+            if mb.len() != n || my.len() != n {
+                return Err(PyValueError::new_err(
+                    "theoretical_mz_b and theoretical_mz_y must have the same length as psm_indices",
+                ));
+            }
+            Some((mb, my))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(PyValueError::new_err(
+                "theoretical_mz_b and theoretical_mz_y must be given together",
+            ))
+        }
+    };
 
     #[derive(Clone)]
     struct Owned {
@@ -348,6 +556,7 @@ pub fn ms2pip_features_from_prediction_peak_arrays(
         py: Vec<f32>,
         ob: Vec<f32>,
         oy: Vec<f32>,
+        mz: Option<Vec<f64>>,
     }
 
     let mut out: Vec<(usize, HashMap<String, f64>)> = Vec::with_capacity(n);
@@ -374,12 +583,22 @@ pub fn ms2pip_features_from_prediction_peak_arrays(
             let ob_vec = any_to_vec_f32(&np, ob_obj)?;
             let oy_vec = any_to_vec_f32(&np, oy_obj)?;
 
+            let mz_vec = match &theoretical_mz {
+                Some((mb, my)) => {
+                    let mut v = any_to_vec_f64(&np, mb[i].bind(py))?;
+                    v.extend(any_to_vec_f64(&np, my[i].bind(py))?);
+                    Some(v)
+                }
+                None => None,
+            };
+
             owned.push(Owned {
                 idx: psm_indices[i],
                 pb: pb_vec,
                 py: py_vec,
                 ob: ob_vec,
                 oy: oy_vec,
+                mz: mz_vec,
             });
         }
 
@@ -536,7 +755,7 @@ pub fn ms2pip_features_from_prediction_peak_arrays(
                     let min_abs_diff_iontype = if min_abs_b_u <= min_abs_y_u { 0.0 } else { 1.0 };
                     let max_abs_diff_iontype = if max_abs_b_u >= max_abs_y_u { 0.0 } else { 1.0 };
 
-                    let mut feats: HashMap<String, f64> = HashMap::with_capacity(66);
+                    let mut feats: HashMap<String, f64> = HashMap::with_capacity(90);
 
                     // log space
                     feats.insert(
@@ -637,6 +856,11 @@ pub fn ms2pip_features_from_prediction_peak_arrays(
                     feats.insert("cos_ionb".into(), finite_or_zero(cos_ionb));
                     feats.insert("cos_iony".into(), finite_or_zero(cos_iony));
 
+                    add_similarity_features(
+                        &mut feats, &tb, &ty, &pb, &pyv, &tb_u, &ty_u, &pb_u, &py_u,
+                        &t_all_u, &p_all_u, it.mz.as_deref(),
+                    );
+
                     (it.idx, feats)
                 })
                 .collect::<Vec<_>>()
@@ -646,4 +870,64 @@ pub fn ms2pip_features_from_prediction_peak_arrays(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Reference values from the original NumPy implementation in mwgard/ms2rescore@7f3d5df
+    // (`_spectra_angle_calc`, `_spectrast_match`, `_weighted_dot_product`, `_nist_ms_match`).
+    const MZ: [f64; 6] = [175.119, 288.203, 401.287, 147.113, 260.197, 373.281];
+    const X: [f64; 6] = [0.20, 0.05, 0.10, 0.30, 0.15, 0.20];
+    const Y: [f64; 6] = [0.25, 0.04, 0.12, 0.28, 0.10, 0.21];
+
+    fn assert_close(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-12, "{a} != {b}");
+    }
+
+    #[test]
+    fn test_spectral_angle() {
+        assert_close(spectral_angle(&X, &Y), 0.8921315119149698);
+        let lx: Vec<f64> = X.iter().map(|v| (v + 0.001).log2()).collect();
+        let ly: Vec<f64> = Y.iter().map(|v| (v + 0.001).log2()).collect();
+        assert_close(spectral_angle(&lx, &ly), 0.9334764009012824);
+        assert!((spectral_angle(&X, &X) - 1.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_spectrast() {
+        assert_close(spectrast(&X, &Y), 0.9715639810426541);
+        assert!(spectrast(&[0.0, 0.0], &[1.0, 2.0]).is_nan());
+    }
+
+    #[test]
+    fn test_weighted_dotprod() {
+        assert_close(weighted_dotprod(&MZ, &X, &Y), 0.9955546637147498);
+        assert!(weighted_dotprod(&MZ[..2], &X, &Y).is_nan());
+    }
+
+    #[test]
+    fn test_nist_match_factor() {
+        assert_close(nist_match_factor(&MZ, &X, &Y), 0.8080843854919356);
+        let px: Vec<f64> = X.iter().copied().map(positive_log).collect();
+        let py: Vec<f64> = Y.iter().copied().map(positive_log).collect();
+        assert_close(nist_match_factor(&MZ, &px, &py), 0.8151864674677505);
+        // identical spectra: DPC = 1, RPP = (n - 1) / n, as the RPP sum over the n - 1
+        // consecutive pairs is divided by the number of peaks (reference implementation)
+        assert_close(nist_match_factor(&MZ, &X, &X), (6.0 + 5.0) / 12.0);
+    }
+
+    #[test]
+    fn test_nist_match_factor_missing_peaks() {
+        // Peaks missing in either spectrum are excluded from the ratio of peak pairs
+        // (the NumPy reference raised a broadcasting error for this input).
+        let x = [1.0, 2.0, 0.0, 4.0, 5.0];
+        let y = [1.0, 0.0, 3.0, 4.0, 5.0];
+        let mz = [100.0, 200.0, 300.0, 400.0, 500.0];
+        let mf = nist_match_factor(&mz, &x, &y);
+        assert!(mf.is_finite() && mf > 0.0 && mf < 1.0);
+        // fewer than two common peaks -> 0
+        assert_close(nist_match_factor(&mz, &[1.0, 0.0, 0.0, 0.0, 0.0], &y), 0.0);
+    }
 }

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ms2pip_features_from_prediction_peak_arrays`: spectral angle (`spectral_angle*`) and
+  SpectraST (`spectrast*`) similarity features, plus, with the new optional
+  `theoretical_mz_b`/`theoretical_mz_y` arguments, the m/z-weighted (Sokolow) dot product
+  (`weighted_dotprod*`) and NIST MS/MS match factor (`nist_match_factor*`), in log
+  (`*_norm`) and unlogged space. Ported from the NumPy implementation in mwgard/ms2rescore;
+  the NIST ratio of peak pairs now only pairs peaks present in both spectra (intensity
+  > 1e-9), which fixes a shape mismatch error of the NumPy version.
 - `annotate_ms2_spectra(..., extended=False)`: with `extended=True`, neutral-loss
   variants, precursor, diagnostic, immonium and satellite ions are matched and
   stored in the new `AnnotatedMS2Spectrum.extended_annotations` field.
